@@ -5,15 +5,18 @@ import re
 from pydantic import BaseModel, Field
 from tqdm import tqdm
 from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 N_RUNS = 5
+MAX_WORKERS = 8
+MAX_RETRIES = 3
 
 # =========================
 # SCHEMA FÜR DIE AUSGABE
 # =========================
 class DirectPHQScore(BaseModel):
-    phq_score: int = Field(..., ge=0, le=27)
-    reasoning: int = Field(...)
+    phq_score: int = Field(..., ge=0, le=27, description="PHQ Score = Severity score for depression")
+    reasoning: str = Field(..., description="A reasoning for why the PHQ is chosen as it is.")
 
 OUTPUT_SCHEMA = DirectPHQScore.model_json_schema()
 
@@ -22,6 +25,7 @@ OUTPUT_SCHEMA = DirectPHQScore.model_json_schema()
 # =========================
 INPUT_PATH = "/home/jovyan/thesisnew-datavol-1/input/DAIC_FULL_NO_TAGS.csv"
 OUTPUT_PATH = "/home/jovyan/thesisnew-datavol-1/output/DIRECT_PHQ/direct_phq_scores_1.csv"
+LONG_OUTPUT_PATH = "/home/jovyan/thesisnew-datavol-1/output/DIRECT_PHQ/direct_phq_reasoning_long.csv"
 
 client = OpenAI(
     base_url="https://llmchat.idm.uk-augsburg.science/api",
@@ -230,18 +234,42 @@ def safe_strip(x):
 def run_single_inference(context_text, current_text):
     messages = build_messages(context_text, current_text)
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages
+            )
+
+            raw_text = safe_strip(response.choices[0].message.content)
+            return parse_llm_output_to_dict(raw_text)
+
+        except Exception as e:
+            if attempt == MAX_RETRIES:
+                return {
+                    "phq_score": None,
+                    "reasoning": None,
+                    "raw_output": None,
+                    "parse_success": False,
+                    "parse_error": str(e)
+                }
+                
+def process_one_row(row_idx, row, run_id):
+    parsed = run_single_inference(
+        context_text=str(row["context_text"]),
+        current_text=str(row[TEXT_COL]),
     )
 
-    raw_text = safe_strip(response.choices[0].message.content)
+    parsed["row_idx"] = row_idx
+    parsed[CONVERSATION_ID_COL] = row[CONVERSATION_ID_COL]
+    parsed["run_id"] = run_id
 
-    return parse_llm_output_to_dict(raw_text)
+    return parsed
 
 # =========================
 # MAIN
 # =========================
+
 df = pd.read_csv(INPUT_PATH)
 
 df = add_cumulative_context(
@@ -255,37 +283,97 @@ os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 all_outputs = []
 
 for run_id in range(1, N_RUNS + 1):
-    parsed_outputs = []
+    parsed_outputs = [None] * len(df)
 
-    for row_idx, row in tqdm(
-        df.iterrows(),
-        total=len(df),
-        desc=f"Processing rows - run {run_id}/{N_RUNS}"
-    ):
-        parsed = run_single_inference(
-            context_text=str(row["context_text"]),
-            current_text=str(row[TEXT_COL]),
-        )
+    # Spalten für diesen Run schon vorher anlegen
+    df[f"phq_score_run_{run_id}"] = pd.NA
+    df[f"reasoning_run_{run_id}"] = pd.NA
+    df[f"raw_output_run_{run_id}"] = pd.NA
+    df[f"parse_success_run_{run_id}"] = pd.NA
+    df[f"parse_error_run_{run_id}"] = pd.NA
 
-        parsed["row_idx"] = row_idx
-        parsed[CONVERSATION_ID_COL] = row[CONVERSATION_ID_COL]
-        parsed["run_id"] = run_id
+    processed_count = 0
 
-        parsed_outputs.append(parsed)
-        all_outputs.append(parsed)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {}
 
-    run_output_df = pd.DataFrame(parsed_outputs)
+        for row_idx, row in df.iterrows():
+            future = executor.submit(
+                process_one_row,
+                row_idx,
+                row,
+                run_id
+            )
+            futures[future] = row_idx
 
-    df[f"phq_score_run_{run_id}"] = run_output_df["phq_score"].values
-    df[f"reasoning_run_{run_id}"] = run_output_df["reasoning"].values
-    df[f"raw_output_run_{run_id}"] = run_output_df["raw_output"].values
-    df[f"parse_success_run_{run_id}"] = run_output_df["parse_success"].values
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=f"Processing rows - run {run_id}/{N_RUNS}"
+        ):
+            row_idx = futures[future]
 
+            try:
+                parsed = future.result()
+
+            except Exception as e:
+                parsed = {
+                    "phq_score": None,
+                    "reasoning": None,
+                    "raw_output": None,
+                    "parse_success": False,
+                    "parse_error": str(e),
+                    "row_idx": row_idx,
+                    CONVERSATION_ID_COL: df.loc[row_idx, CONVERSATION_ID_COL],
+                    "run_id": run_id
+                }
+
+            parsed_outputs[row_idx] = parsed
+            all_outputs.append(parsed)
+
+            # Ergebnis direkt in df schreiben
+            df.loc[row_idx, f"phq_score_run_{run_id}"] = parsed["phq_score"]
+            df.loc[row_idx, f"reasoning_run_{run_id}"] = parsed["reasoning"]
+            df.loc[row_idx, f"raw_output_run_{run_id}"] = parsed["raw_output"]
+            df.loc[row_idx, f"parse_success_run_{run_id}"] = parsed["parse_success"]
+            df.loc[row_idx, f"parse_error_run_{run_id}"] = parsed["parse_error"]
+
+            processed_count += 1
+
+            # Alle 100 fertig bearbeiteten Zeilen zwischenspeichern
+            if processed_count % 100 == 0:
+                df.to_csv(OUTPUT_PATH, index=False)
+
+                all_outputs_df = pd.DataFrame(all_outputs)
+                all_outputs_df.to_csv(LONG_OUTPUT_PATH, index=False)
+
+                print(f"Zwischengespeichert: Run {run_id}, {processed_count} Zeilen fertig.")
+
+    # Am Ende jedes Runs nochmal speichern
     df.to_csv(OUTPUT_PATH, index=False)
 
-all_outputs_df = pd.DataFrame(all_outputs)
+    all_outputs_df = pd.DataFrame(all_outputs)
+    all_outputs_df.to_csv(LONG_OUTPUT_PATH, index=False)
 
-all_outputs_df.to_csv(
-    "/home/jovyan/thesisnew-datavol-1/output/DIRECT_PHQ/direct_phq_outputs_long.csv",
-    index=False
-)
+    print(f"Run {run_id} fertig gespeichert.")
+
+
+# =========================
+# AGGREGATION
+# =========================
+
+run_cols = [f"phq_score_run_{i}" for i in range(1, N_RUNS + 1)]
+
+df["phq_score_mean"] = df[run_cols].mean(axis=1)
+df["phq_score_std"] = df[run_cols].std(axis=1)
+df["phq_score_median"] = df[run_cols].median(axis=1)
+df["phq_score_mean_rounded"] = df["phq_score_mean"].round().astype("Int64")
+
+df.to_csv(OUTPUT_PATH, index=False)
+
+all_outputs_df = pd.DataFrame(all_outputs)
+all_outputs_df.to_csv(LONG_OUTPUT_PATH, index=False)
+
+print("Fertig.")
+print(df.shape)
+print(all_outputs_df.shape)
