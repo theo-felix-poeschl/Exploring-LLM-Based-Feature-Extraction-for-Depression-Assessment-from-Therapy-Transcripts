@@ -158,6 +158,8 @@ def get_few_shot_examples(query_point: dict) -> list:
     for pid in participant_ids:
         grp = neighbor_df[neighbor_df["Participant_ID"] == pid].copy()
 
+        transcript = make_transcript(grp)
+
         example = {
             "Participant_ID": pid,
             "PHQ8_Concentrating": grp["PHQ8_Concentrating"].iloc[0],
@@ -168,7 +170,12 @@ def get_few_shot_examples(query_point: dict) -> list:
             "PHQ8_Failure":       grp["PHQ8_Failure"].iloc[0],
             "PHQ8_Moving":        grp["PHQ8_Moving"].iloc[0],
             "PHQ8_Sleep":         grp["PHQ8_Sleep"].iloc[0],
-            "transcript": make_transcript(grp)
+
+            # Anzahl der Turns im Neighbor-Transcript
+            "n_turns": len(grp),
+
+            # Das eigentliche Beispiel-Transkript
+            "transcript": transcript
         }
         examples.append(example)
 
@@ -184,14 +191,19 @@ def make_persona_text(persona: dict) -> str:
     Occupation: {persona["occupation"]}""".strip()
 
 
-def build_messages(target_feats: dict, persona: dict, examples: list) -> list:
+def build_messages(
+    target_feats: dict,
+    persona: dict,
+    examples: list,
+    neighbor_mean_n_turns: int
+) -> list:
     system_prompt = f"""
         You generate synthetic therapy dialog transcripts for research.
 
         You will be given the features and transcript of the {N_FEW_SHOT}-nearest neighbors as examples.
         These examples serve as a template for content, conversation structure, response style, and length.
 
-        PHQ8 Features (higher values → higher degree of symptoms):
+        PHQ8 Features (higher values => higher degree of symptoms):
         - PHQ8_NoInterest:   Little interest or pleasure in doing things.
         - PHQ8_Depressed:    Feeling down, depressed, or hopeless.
         - PHQ8_Sleep:        Trouble falling/staying asleep, or sleeping too much.
@@ -209,6 +221,7 @@ def build_messages(target_feats: dict, persona: dict, examples: list) -> list:
         - Use proper grammar and punctuation even if the given examples might not do that.
         - The speaker value can only be "Therapist" or "Participant".
         - The Participant should give answers of varying lengths, just like in real interviews.
+        - The generated transcript should contain approximately {neighbor_mean_n_turns} turns.
         - The JSON must have exactly this structure:
 
         {{
@@ -285,6 +298,9 @@ def build_messages(target_feats: dict, persona: dict, examples: list) -> list:
         PHQ8_Failure:       {target_feats["PHQ8_Failure"]}
         PHQ8_Moving:        {target_feats["PHQ8_Moving"]}
         PHQ8_Sleep:         {target_feats["PHQ8_Sleep"]}
+
+        Length requirement:
+                The generated transcript should contain approximately {neighbor_mean_n_turns} turns.
 
         Return only valid JSON with this exact structure:
 
@@ -501,10 +517,18 @@ for _, row in tqdm(target_features.iterrows(), total=len(target_features)):
     query_point = target_dict
 
     try:
-        persona   = generate_random_persona(gender=random.choice(GENDERS), age_range=(18, 80))
-        examples  = get_few_shot_examples(query_point)
+        persona = generate_random_persona(gender=random.choice(GENDERS), age_range=(18, 80))
+        examples = get_few_shot_examples(query_point)
 
-        messages  = build_messages(target_feats=target_dict, persona=persona, examples=examples)
+        neighbor_mean_n_turns = int(round(np.mean([ex["n_turns"] for ex in examples])))
+
+        messages = build_messages(
+            target_feats=target_dict,
+            persona=persona,
+            examples=examples,
+            neighbor_mean_n_turns=neighbor_mean_n_turns
+        )
+        
         transcript = call_llm(messages)
 
         long_rows = transcript_to_long_rows(
