@@ -21,8 +21,8 @@ FEATURES_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-De
 TRANSCRIPT_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/INPUT/DAIC_FULL_NO_TAGS.csv")
 NEIGHBORING_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/INPUT/DAIC_META.csv")
 
-OUTPUT_FILE = Path("/home/jovyan/finetuning-qwen-datavol-1/synthetic_data_generation/output/10_synthetic_transcripts.csv")
-ERROR_FILE = Path("/home/jovyan/finetuning-qwen-datavol-1/synthetic_data_generation/output/synthetic_transcripts_errors.csv")
+OUTPUT_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/OUTPUT/10_synthetic_transcripts.csv")
+ERROR_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/OUTPUT/synthetic_transcripts_errors.csv")
 
 MODEL_NAME = "openai/gpt-oss-120b"
 BASE_URL = "https://llmchat.idm.uk-augsburg.science/api"
@@ -76,14 +76,14 @@ print("Participants mit Transcript:", transcript_df["Participant_ID"].nunique())
 # Ziel-Feature-Kombinationen erzeugen
 # ----------------------------------------------------------------------
 target_features = pd.DataFrame({
-    "PHQ8_Concentrating": np.random.randint(0, 5, size=N_SYNTHETIC),
-    "PHQ8_Appetite":      np.random.randint(0, 5, size=N_SYNTHETIC),
-    "PHQ8_Depressed":     np.random.randint(0, 5, size=N_SYNTHETIC),
-    "PHQ8_Tired":         np.random.randint(0, 5, size=N_SYNTHETIC),
-    "PHQ8_NoInterest":    np.random.randint(0, 5, size=N_SYNTHETIC),
-    "PHQ8_Failure":       np.random.randint(0, 5, size=N_SYNTHETIC),
-    "PHQ8_Moving":        np.random.randint(0, 5, size=N_SYNTHETIC),
-    "PHQ8_Sleep":         np.random.randint(0, 5, size=N_SYNTHETIC),
+    "PHQ8_Concentrating": np.random.randint(0, 3, size=N_SYNTHETIC),
+    "PHQ8_Appetite":      np.random.randint(0, 3, size=N_SYNTHETIC),
+    "PHQ8_Depressed":     np.random.randint(0, 3, size=N_SYNTHETIC),
+    "PHQ8_Tired":         np.random.randint(0, 3, size=N_SYNTHETIC),
+    "PHQ8_NoInterest":    np.random.randint(0, 3, size=N_SYNTHETIC),
+    "PHQ8_Failure":       np.random.randint(0, 3, size=N_SYNTHETIC),
+    "PHQ8_Moving":        np.random.randint(0, 3, size=N_SYNTHETIC),
+    "PHQ8_Sleep":         np.random.randint(0, 3, size=N_SYNTHETIC),
 })
 
 target_features["synthetic_id"] = [f"syn_{i:04d}" for i in range(len(target_features))]
@@ -112,7 +112,8 @@ def get_few_shot_examples(query_point: dict) -> list:
     neighbor_df = find_neighbors(
         csv_path=NEIGHBORING_FILE,
         query=query_point,
-        feature_cols=list(query_point.keys())
+        feature_cols=list(query_point.keys()),
+        k = N_FEW_SHOT
     )
 
     neighbor_df = pd.merge(
