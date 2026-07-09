@@ -506,30 +506,6 @@ synthetic_level_df = (
     .reset_index()
 )
 
-
-# ----------------------------------------------------------------------
-# Speichern
-# ----------------------------------------------------------------------
-comparison_file = OUTPUT_DIR / "neighbor_pattern_comparison_long.csv"
-summary_file = OUTPUT_DIR / "neighbor_pattern_summary.csv"
-summary_by_phq_group_file = OUTPUT_DIR / "neighbor_pattern_summary_by_phq_group.csv"
-neighbor_ids_file = OUTPUT_DIR / "synthetic_neighbor_ids.csv"
-synthetic_level_file = OUTPUT_DIR / "synthetic_level_summary.csv"
-
-comparison_df.to_csv(comparison_file, index=False)
-summary_df.to_csv(summary_file, index=False)
-summary_by_phq_group_df.to_csv(summary_by_phq_group_file, index=False)
-neighbor_ids_df.to_csv(neighbor_ids_file, index=False)
-synthetic_level_df.to_csv(synthetic_level_file, index=False)
-
-print("Gespeichert:")
-print(comparison_file)
-print(summary_file)
-print(summary_by_phq_group_file)
-print(neighbor_ids_file)
-print(synthetic_level_file)
-
-
 # ----------------------------------------------------------------------
 # Plot 1: Mean absolute z-difference pro Pattern
 # ----------------------------------------------------------------------
