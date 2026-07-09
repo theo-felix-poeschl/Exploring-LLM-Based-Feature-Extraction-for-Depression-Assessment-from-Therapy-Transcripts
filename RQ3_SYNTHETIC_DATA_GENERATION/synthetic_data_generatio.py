@@ -5,6 +5,7 @@ import os
 import time
 import json
 import random
+import re
 import pandas as pd
 import numpy as np
 
@@ -14,6 +15,10 @@ from openai import OpenAI
 from neighboring import find_neighbors
 from create_personas import generate_random_persona, GENDERS
 
+from pydantic import BaseModel, Field, field_validator, ValidationError
+from typing import Literal
+
+
 # ----------------------------------------------------------------------
 # Pfade & Konstanten
 # ----------------------------------------------------------------------
@@ -21,7 +26,7 @@ FEATURES_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-De
 TRANSCRIPT_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/INPUT/DAIC_FULL_NO_TAGS.csv")
 NEIGHBORING_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/INPUT/DAIC_META.csv")
 
-OUTPUT_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/OUTPUT/10_synthetic_transcripts.csv")
+OUTPUT_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/OUTPUT/10_synthetic_transcripts_long.csv")
 ERROR_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/OUTPUT/synthetic_transcripts_errors.csv")
 
 MODEL_NAME = "openai/gpt-oss-120b"
@@ -45,6 +50,27 @@ MAX_EXAMPLE_TURNS = None  # None → komplette Beispiel-Transkripte
 random.seed(42)
 np.random.seed(42)
 
+
+# ----------------------------------------------------------------------
+# Pydantic-Schema für LLM-Ausgabe
+# ----------------------------------------------------------------------
+class TranscriptTurn(BaseModel):
+    speaker: Literal["Therapist", "Participant"]
+    value: str = Field(min_length=1)
+
+    @field_validator("value")
+    @classmethod
+    def clean_value(cls, v):
+        v = str(v).strip()
+        if not v:
+            raise ValueError("value darf nicht leer sein")
+        return v
+
+
+class SyntheticTranscript(BaseModel):
+    turns: list[TranscriptTurn] = Field(min_length=1)
+
+
 # ----------------------------------------------------------------------
 # OpenAI-Client
 # ----------------------------------------------------------------------
@@ -52,6 +78,7 @@ client = OpenAI(
     api_key="sk-ab5121e5ffda4b76bdf1240d07e552f9",
     base_url=BASE_URL,
 )
+
 
 # ----------------------------------------------------------------------
 # Daten einlesen
@@ -72,6 +99,7 @@ print("Features:", features_df.shape)
 print("Transcripts:", transcript_df.shape)
 print("Participants mit Transcript:", transcript_df["Participant_ID"].nunique())
 
+
 # ----------------------------------------------------------------------
 # Ziel-Feature-Kombinationen erzeugen
 # ----------------------------------------------------------------------
@@ -87,6 +115,7 @@ target_features = pd.DataFrame({
 })
 
 target_features["synthetic_id"] = [f"syn_{i:04d}" for i in range(len(target_features))]
+
 
 # ----------------------------------------------------------------------
 # Hilfsfunktionen
@@ -113,7 +142,7 @@ def get_few_shot_examples(query_point: dict) -> list:
         csv_path=NEIGHBORING_FILE,
         query=query_point,
         feature_cols=list(query_point.keys()),
-        k = N_FEW_SHOT
+        k=N_FEW_SHOT
     )
 
     neighbor_df = pd.merge(
@@ -139,7 +168,6 @@ def get_few_shot_examples(query_point: dict) -> list:
             "PHQ8_Failure":       grp["PHQ8_Failure"].iloc[0],
             "PHQ8_Moving":        grp["PHQ8_Moving"].iloc[0],
             "PHQ8_Sleep":         grp["PHQ8_Sleep"].iloc[0],
-            # Das eigentliche Beispiel-Transkript:
             "transcript": make_transcript(grp)
         }
         examples.append(example)
@@ -174,18 +202,32 @@ def build_messages(target_feats: dict, persona: dict, examples: list) -> list:
         - PHQ8_Moving:       Moving/speaking slowly, or being fidgety/restless.
 
         Rules:
-        - Output only the transcript.
-        - Use this format: speaker | value | target_PHQ8_Concentrating | target_PHQ8_Appetite | target_PHQ8_Depressed | target_PHQ8_Tired | target_PHQ8_NoInterest | target_PHQ8_Failure | target_PHQ8_Moving | target_PHQ8_Sleep
-        - Use proper grammar and punctuation even if the given examples might not do that.
-        - In the speaker value there can only be the values "Therapist" or "Participant"
-        - The Participant should give answers of varying lengths, just like in real interviews.
-        - Do not copy the examples.
+        - Output only valid JSON.
+        - Do not use markdown.
         - Do not explain anything.
+        - Do not copy the examples.
+        - Use proper grammar and punctuation even if the given examples might not do that.
+        - The speaker value can only be "Therapist" or "Participant".
+        - The Participant should give answers of varying lengths, just like in real interviews.
+        - The JSON must have exactly this structure:
+
+        {{
+          "turns": [
+            {{
+              "speaker": "Therapist",
+              "value": "utterance text"
+            }},
+            {{
+              "speaker": "Participant",
+              "value": "utterance text"
+            }}
+          ]
+        }}
         """.strip()
 
     messages = [{"role": "system", "content": system_prompt}]
 
-            # ---- Few-Shot-Beispiele -------------------------------------------------
+    # ---- Few-Shot-Beispiele -------------------------------------------------
     for ex in examples:
         user_msg = f"""
         Generate a transcript with these features:
@@ -200,7 +242,29 @@ def build_messages(target_feats: dict, persona: dict, examples: list) -> list:
         PHQ8_Sleep:         {ex["PHQ8_Sleep"]}
         """.strip()
 
-        assistant_msg = ex["transcript"]
+        # Few-shot assistant message jetzt ebenfalls im gewünschten JSON-Format.
+        example_turns = []
+        for line in ex["transcript"].splitlines():
+            if "|" not in line:
+                continue
+
+            speaker, value = line.split("|", 1)
+            speaker = speaker.strip()
+            value = value.strip()
+
+            if speaker not in ["Therapist", "Participant"]:
+                continue
+
+            if value:
+                example_turns.append({
+                    "speaker": speaker,
+                    "value": value
+                })
+
+        assistant_msg = json.dumps(
+            {"turns": example_turns},
+            ensure_ascii=False
+        )
 
         messages.append({"role": "user", "content": user_msg})
         messages.append({"role": "assistant", "content": assistant_msg})
@@ -222,17 +286,107 @@ def build_messages(target_feats: dict, persona: dict, examples: list) -> list:
         PHQ8_Moving:        {target_feats["PHQ8_Moving"]}
         PHQ8_Sleep:         {target_feats["PHQ8_Sleep"]}
 
-        Use this format:
+        Return only valid JSON with this exact structure:
 
-        speaker | value | target_PHQ8_Concentrating | target_PHQ8_Appetite | target_PHQ8_Depressed | target_PHQ8_Tired | target_PHQ8_NoInterest | target_PHQ8_Failure | target_PHQ8_Moving | target_PHQ8_Sleep
+        {{
+          "turns": [
+            {{
+              "speaker": "Therapist",
+              "value": "utterance text"
+            }},
+            {{
+              "speaker": "Participant",
+              "value": "utterance text"
+            }}
+          ]
+        }}
         """.strip()
 
     messages.append({"role": "user", "content": final_user_msg})
     return messages
 
 
-def call_llm(messages: list) -> str:
-    """Wrapper-Funktion für den Chat-Aufruf mit einfachem Retry-Mechanismus."""
+def extract_json_object(text: str) -> str:
+    """
+    Extrahiert das erste JSON-Objekt aus einer Modellantwort.
+    Hilft, falls das Modell doch ```json oder Text drumherum produziert.
+    """
+    text = text.strip()
+
+    # Markdown-Fences entfernen, falls vorhanden
+    text = re.sub(r"^```json\s*", "", text)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    # Direkt gültiges JSON
+    if text.startswith("{") and text.endswith("}"):
+        return text
+
+    # Erstes JSON-Objekt herausziehen
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if match:
+        return match.group(0)
+
+    raise ValueError("Kein JSON-Objekt in der LLM-Ausgabe gefunden.")
+
+
+def parse_pipe_fallback(raw_text: str) -> SyntheticTranscript:
+    """
+    Notfall-Fallback, falls das Modell doch kein JSON liefert.
+    Akzeptiert Zeilen wie:
+    Therapist | hello
+    Participant | hi
+    """
+    turns = []
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2:
+            continue
+
+        speaker = parts[0]
+        value = parts[1]
+
+        if speaker in ["Therapist", "Participant"] and value:
+            turns.append({
+                "speaker": speaker,
+                "value": value
+            })
+
+    if not turns:
+        raise ValueError("Auch Pipe-Fallback konnte keine Turns parsen.")
+
+    return SyntheticTranscript(turns=turns)
+
+
+def parse_llm_output(raw_text: str) -> SyntheticTranscript:
+    """
+    Validiert die LLM-Ausgabe mit Pydantic.
+    Erst JSON, dann robuster Pipe-Fallback.
+    """
+    try:
+        json_text = extract_json_object(raw_text)
+        data = json.loads(json_text)
+        return SyntheticTranscript.model_validate(data)
+
+    except Exception:
+        return parse_pipe_fallback(raw_text)
+
+
+def call_llm(messages: list) -> SyntheticTranscript:
+    """
+    Wrapper-Funktion für den Chat-Aufruf mit Retry.
+    Die API wird nicht mit response_format/schema gezwungen, weil das bei
+    manchen OpenAI-kompatiblen Endpoints ständig Fehler verursacht.
+    Stattdessen wird lokal mit Pydantic validiert.
+    """
+    last_error = None
+    last_raw_text = None
+
     for attempt in range(3):
         try:
             response = client.chat.completions.create(
@@ -240,12 +394,86 @@ def call_llm(messages: list) -> str:
                 messages=messages,
                 temperature=0.8
             )
-            return response.choices[0].message.content.strip()
+
+            raw_text = response.choices[0].message.content.strip()
+            last_raw_text = raw_text
+
+            parsed = parse_llm_output(raw_text)
+            return parsed
+
         except Exception as e:
-            print("Fehler beim LLM-Call:", e)
+            last_error = e
+            print(f"Fehler beim LLM-Call oder Parsing, Versuch {attempt + 1}/3:", e)
+
+            # Bei Parsing-Fehlern dem Modell beim nächsten Versuch klarer sagen,
+            # was schiefgelaufen ist.
+            messages = messages + [
+                {
+                    "role": "assistant",
+                    "content": last_raw_text if last_raw_text else ""
+                },
+                {
+                    "role": "user",
+                    "content": """
+                    Your previous answer could not be parsed.
+                    Return only valid JSON.
+                    Do not use markdown.
+                    Use exactly this structure:
+
+                    {
+                      "turns": [
+                        {
+                          "speaker": "Therapist",
+                          "value": "utterance text"
+                        },
+                        {
+                          "speaker": "Participant",
+                          "value": "utterance text"
+                        }
+                      ]
+                    }
+                    """.strip()
+                }
+            ]
+
             time.sleep(2 + attempt * 2)
 
-    raise RuntimeError("LLM-Call nach 3 Versuchen fehlgeschlagen")
+    raise RuntimeError(f"LLM-Call nach 3 Versuchen fehlgeschlagen: {repr(last_error)}")
+
+def transcript_to_long_rows(
+    synthetic_id: str,
+    parsed_transcript: SyntheticTranscript,
+    target_dict: dict
+) -> list[dict]:
+    """
+    Wandelt das validierte Pydantic-Objekt in Long Format um.
+
+    Ausgabe:
+    synthetic_id,
+    target_PHQ8_...,
+    target_PHQ8_Score,
+    speaker,
+    value
+    """
+    rows = []
+
+    target_cols = {
+        f"target_{key}": int(value)
+        for key, value in target_dict.items()
+    }
+
+    target_score = int(sum(target_dict.values()))
+
+    for turn in parsed_transcript.turns:
+        rows.append({
+            "synthetic_id": synthetic_id,
+            **target_cols,
+            "target_PHQ8_Score": target_score,
+            "speaker": turn.speaker,
+            "value": turn.value
+        })
+
+    return rows
 
 
 # ----------------------------------------------------------------------
@@ -270,7 +498,7 @@ for _, row in tqdm(target_features.iterrows(), total=len(target_features)):
     }
 
     # ---- Nachbarschaftssuche (Few-Shot) ---------------------------------
-    query_point = target_dict  # wir verwenden exakt die 8 Features
+    query_point = target_dict
 
     try:
         persona   = generate_random_persona(gender=random.choice(GENDERS), age_range=(18, 80))
@@ -279,16 +507,13 @@ for _, row in tqdm(target_features.iterrows(), total=len(target_features)):
         messages  = build_messages(target_feats=target_dict, persona=persona, examples=examples)
         transcript = call_llm(messages)
 
-        result = {
-            "synthetic_id": synthetic_id,
-            **target_dict,
-            "persona": json.dumps(persona, ensure_ascii=False),
-            "few_shot_participants": json.dumps([ex["Participant_ID"] for ex in examples], ensure_ascii=False),
-            "synthetic_transcript": transcript,
-            "messages": json.dumps(messages, ensure_ascii=False),
-        }
+        long_rows = transcript_to_long_rows(
+            synthetic_id=synthetic_id,
+            parsed_transcript=transcript,
+            target_dict=target_dict
+        )
 
-        results.append(result)
+        results.extend(long_rows)
 
         # Zwischenspeichern, damit kein Datenverlust bei einem Crash entsteht
         pd.DataFrame(results).to_csv(OUTPUT_FILE, index=False)
@@ -296,15 +521,30 @@ for _, row in tqdm(target_features.iterrows(), total=len(target_features)):
         time.sleep(0.5)
 
     except Exception as e:
-        error = {"synthetic_id": synthetic_id, "error": repr(e)}
+        error = {
+            "synthetic_id": synthetic_id,
+            "error": repr(e)
+        }
         errors.append(error)
         pd.DataFrame(errors).to_csv(ERROR_FILE, index=False)
         print("Fehler bei", synthetic_id, e)
 
+
 # ----------------------------------------------------------------------
 # Ergebnis-Export
 # ----------------------------------------------------------------------
-results_df = pd.DataFrame(results)
+target_output_columns = [f"target_{col}" for col in FEATURE_COLUMNS]
+
+results_df = pd.DataFrame(
+    results,
+    columns=[
+        "synthetic_id",
+        *target_output_columns,
+        "target_PHQ8_Score",
+        "speaker",
+        "value"
+    ]
+)
 errors_df  = pd.DataFrame(errors)
 
 results_df.to_csv(OUTPUT_FILE, index=False)
