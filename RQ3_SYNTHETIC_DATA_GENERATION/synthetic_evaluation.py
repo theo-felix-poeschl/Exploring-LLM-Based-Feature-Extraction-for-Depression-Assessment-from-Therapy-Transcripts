@@ -50,8 +50,8 @@ FEATURE_COLUMNS = [
 TARGET_COLUMNS = [f"target_{col}" for col in FEATURE_COLUMNS]
 
 N_NEIGHBORS = 5
-
 SHORT_TURN_WORD_THRESHOLD = 3
+PHQ_CUTOFF = 10
 
 
 # ----------------------------------------------------------------------
@@ -64,13 +64,16 @@ transcript_df = pd.read_csv(TRANSCRIPT_FILE)
 features_df["Participant_ID"] = pd.to_numeric(features_df["Participant_ID"], errors="coerce")
 transcript_df["Participant_ID"] = pd.to_numeric(transcript_df["Participant_ID"], errors="coerce")
 
+features_df = features_df.dropna(subset=["Participant_ID"]).copy()
+features_df["Participant_ID"] = features_df["Participant_ID"].astype(int)
+
 transcript_df = transcript_df.dropna(subset=["Participant_ID", "speaker", "value"]).copy()
 transcript_df["Participant_ID"] = transcript_df["Participant_ID"].astype(int)
 transcript_df["speaker"] = transcript_df["speaker"].astype(str).str.strip()
 transcript_df["value"] = transcript_df["value"].astype(str).str.strip()
 
 if "start_time" in transcript_df.columns:
-    transcript_df = transcript_df.sort_values(["Participant_ID", "start_time"])
+    transcript_df = transcript_df.sort_values(["Participant_ID", "start_time"]).reset_index(drop=True)
 else:
     transcript_df = transcript_df.sort_values(["Participant_ID"]).reset_index(drop=True)
 
@@ -81,11 +84,43 @@ synthetic_df["value"] = synthetic_df["value"].astype(str).str.strip()
 for col in TARGET_COLUMNS:
     synthetic_df[col] = pd.to_numeric(synthetic_df[col], errors="coerce")
 
+for col in FEATURE_COLUMNS:
+    features_df[col] = pd.to_numeric(features_df[col], errors="coerce")
+
+# ----------------------------------------------------------------------
+# PHQ-8 Scores berechnen
+# ----------------------------------------------------------------------
+synthetic_df["target_PHQ8_Score"] = synthetic_df[TARGET_COLUMNS].sum(axis=1)
+synthetic_df["target_PHQ8_binary"] = synthetic_df["target_PHQ8_Score"] >= PHQ_CUTOFF
+synthetic_df["target_PHQ8_group"] = np.where(
+    synthetic_df["target_PHQ8_binary"],
+    "PHQ >= 10",
+    "PHQ < 10"
+)
+
+features_df["real_PHQ8_Score_from_items"] = features_df[FEATURE_COLUMNS].sum(axis=1)
+features_df["real_PHQ8_binary_from_items"] = features_df["real_PHQ8_Score_from_items"] >= PHQ_CUTOFF
+features_df["real_PHQ8_group_from_items"] = np.where(
+    features_df["real_PHQ8_binary_from_items"],
+    "PHQ >= 10",
+    "PHQ < 10"
+)
 
 print("Synthetic rows:", synthetic_df.shape)
 print("Synthetic transcripts:", synthetic_df["synthetic_id"].nunique())
 print("Real transcript rows:", transcript_df.shape)
 print("Real participants:", transcript_df["Participant_ID"].nunique())
+print()
+print("Synthetic PHQ groups:")
+print(
+    synthetic_df[["synthetic_id", "target_PHQ8_group"]]
+    .drop_duplicates()
+    ["target_PHQ8_group"]
+    .value_counts()
+)
+print()
+print("Real PHQ groups in metadata:")
+print(features_df["real_PHQ8_group_from_items"].value_counts())
 
 
 # ----------------------------------------------------------------------
@@ -110,20 +145,38 @@ def normalize_speaker(speaker):
 def tokenize(text):
     """
     Einfache Wort-Tokenisierung.
-    Für deine Zwecke ausreichend, weil es um relative Basic Patterns geht.
     """
     return re.findall(r"[A-Za-z']+", str(text).lower())
 
 
-def compute_pattern_features(df):
+def compute_pattern_features(df, collapse_same_speaker=True):
     """
     Berechnet einfache strukturelle und lexikalische Pattern-Metriken
     für ein Transcript im Long Format.
-    Erwartete Spalten: speaker, value
+
+    Wenn collapse_same_speaker=True, werden direkt aufeinanderfolgende
+    Zeilen desselben Speakers zu einem Turn zusammengefasst.
     """
     tmp = df.copy()
     tmp["speaker_norm"] = tmp["speaker"].apply(normalize_speaker)
-    tmp["value"] = tmp["value"].fillna("").astype(str)
+    tmp["value"] = tmp["value"].fillna("").astype(str).str.strip()
+
+    tmp = tmp[tmp["value"] != ""].copy()
+
+    if collapse_same_speaker and len(tmp) > 0:
+        tmp["_speaker_block"] = (
+            tmp["speaker_norm"] != tmp["speaker_norm"].shift()
+        ).cumsum()
+
+        tmp = (
+            tmp
+            .groupby("_speaker_block", as_index=False)
+            .agg(
+                speaker_norm=("speaker_norm", "first"),
+                value=("value", lambda x: " ".join(x))
+            )
+        )
+
     tmp["tokens"] = tmp["value"].apply(tokenize)
     tmp["n_words"] = tmp["tokens"].apply(len)
 
@@ -210,6 +263,24 @@ def safe_pct_diff(value, mean):
     return (value - mean) / mean * 100
 
 
+def compute_neighbor_distances(neighbor_df, query_point, feature_cols):
+    """
+    Berechnet euklidische Distanzen zwischen Query-Target und gefundenen Nachbar:innen.
+    """
+    tmp = neighbor_df.copy()
+
+    for col in feature_cols:
+        tmp[col] = pd.to_numeric(tmp[col], errors="coerce")
+
+    query_vector = np.array([query_point[col] for col in feature_cols], dtype=float)
+    neighbor_matrix = tmp[feature_cols].to_numpy(dtype=float)
+
+    distances = np.sqrt(((neighbor_matrix - query_vector) ** 2).sum(axis=1))
+    tmp["neighbor_distance"] = distances
+
+    return tmp
+
+
 # ----------------------------------------------------------------------
 # Evaluation
 # ----------------------------------------------------------------------
@@ -217,7 +288,15 @@ comparison_rows = []
 neighbor_id_rows = []
 
 synthetic_targets = (
-    synthetic_df[["synthetic_id", *TARGET_COLUMNS]]
+    synthetic_df[
+        [
+            "synthetic_id",
+            *TARGET_COLUMNS,
+            "target_PHQ8_Score",
+            "target_PHQ8_binary",
+            "target_PHQ8_group"
+        ]
+    ]
     .drop_duplicates("synthetic_id")
     .reset_index(drop=True)
 )
@@ -243,6 +322,12 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
         k=N_NEIGHBORS
     )
 
+    neighbor_df = compute_neighbor_distances(
+        neighbor_df=neighbor_df,
+        query_point=query_point,
+        feature_cols=FEATURE_COLUMNS
+    )
+
     neighbor_ids = (
         neighbor_df["Participant_ID"]
         .drop_duplicates()
@@ -250,9 +335,35 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
         .tolist()
     )
 
+    # Metadaten der gefundenen Nachbar:innen ergänzen
+    neighbor_meta = features_df[
+        features_df["Participant_ID"].isin(neighbor_ids)
+    ].copy()
+
+    mean_neighbor_distance = neighbor_df["neighbor_distance"].mean()
+    min_neighbor_distance = neighbor_df["neighbor_distance"].min()
+    max_neighbor_distance = neighbor_df["neighbor_distance"].max()
+
+    mean_neighbor_phq8_score = neighbor_meta["real_PHQ8_Score_from_items"].mean()
+    n_neighbor_phq_ge_10 = int(neighbor_meta["real_PHQ8_binary_from_items"].sum())
+    share_neighbor_phq_ge_10 = neighbor_meta["real_PHQ8_binary_from_items"].mean()
+
     neighbor_id_rows.append({
         "synthetic_id": synthetic_id,
-        "neighbor_ids": json.dumps(neighbor_ids)
+
+        "target_PHQ8_Score": syn_row["target_PHQ8_Score"],
+        "target_PHQ8_binary": syn_row["target_PHQ8_binary"],
+        "target_PHQ8_group": syn_row["target_PHQ8_group"],
+
+        "neighbor_ids": json.dumps(neighbor_ids),
+
+        "mean_neighbor_distance": mean_neighbor_distance,
+        "min_neighbor_distance": min_neighbor_distance,
+        "max_neighbor_distance": max_neighbor_distance,
+
+        "mean_neighbor_PHQ8_Score": mean_neighbor_phq8_score,
+        "n_neighbor_PHQ_ge_10": n_neighbor_phq_ge_10,
+        "share_neighbor_PHQ_ge_10": share_neighbor_phq_ge_10,
     })
 
     # -----------------------------
@@ -298,10 +409,15 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
 
         diff = synthetic_value - neighbor_mean
         abs_diff = abs(diff)
+        z_diff = safe_z_score(synthetic_value, neighbor_mean, neighbor_sd)
 
         comparison_rows.append({
             "synthetic_id": synthetic_id,
             "metric": metric_name,
+
+            "target_PHQ8_Score": syn_row["target_PHQ8_Score"],
+            "target_PHQ8_binary": syn_row["target_PHQ8_binary"],
+            "target_PHQ8_group": syn_row["target_PHQ8_group"],
 
             "synthetic_value": synthetic_value,
             "neighbor_mean": neighbor_mean,
@@ -311,13 +427,21 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
 
             "diff": diff,
             "abs_diff": abs_diff,
-            "z_diff": safe_z_score(synthetic_value, neighbor_mean, neighbor_sd),
-            "abs_z_diff": abs(safe_z_score(synthetic_value, neighbor_mean, neighbor_sd)),
+            "z_diff": z_diff,
+            "abs_z_diff": abs(z_diff) if not pd.isna(z_diff) else np.nan,
             "pct_diff": safe_pct_diff(synthetic_value, neighbor_mean),
 
             "within_neighbor_range": (
                 synthetic_value >= neighbor_min and synthetic_value <= neighbor_max
             ),
+
+            "mean_neighbor_distance": mean_neighbor_distance,
+            "min_neighbor_distance": min_neighbor_distance,
+            "max_neighbor_distance": max_neighbor_distance,
+
+            "mean_neighbor_PHQ8_Score": mean_neighbor_phq8_score,
+            "n_neighbor_PHQ_ge_10": n_neighbor_phq_ge_10,
+            "share_neighbor_PHQ_ge_10": share_neighbor_phq_ge_10,
 
             "n_neighbors_used": len(neighbor_values)
         })
@@ -325,6 +449,9 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
 
 comparison_df = pd.DataFrame(comparison_rows)
 neighbor_ids_df = pd.DataFrame(neighbor_id_rows)
+
+if comparison_df.empty:
+    raise RuntimeError("comparison_df ist leer. Prüfe Synthetic-Datei, Target-Spalten und Neighbor-Suche.")
 
 
 # ----------------------------------------------------------------------
@@ -342,10 +469,41 @@ summary_df = (
         mean_abs_z_diff=("abs_z_diff", "mean"),
         median_abs_z_diff=("abs_z_diff", "median"),
         within_neighbor_range_rate=("within_neighbor_range", "mean"),
+        mean_neighbor_distance=("mean_neighbor_distance", "mean"),
         n=("synthetic_id", "nunique")
     )
     .reset_index()
     .sort_values("mean_abs_z_diff", ascending=False)
+)
+
+summary_by_phq_group_df = (
+    comparison_df
+    .groupby(["target_PHQ8_group", "metric"])
+    .agg(
+        mean_synthetic_value=("synthetic_value", "mean"),
+        mean_neighbor_value=("neighbor_mean", "mean"),
+        mean_abs_diff=("abs_diff", "mean"),
+        median_abs_diff=("abs_diff", "median"),
+        mean_abs_z_diff=("abs_z_diff", "mean"),
+        median_abs_z_diff=("abs_z_diff", "median"),
+        within_neighbor_range_rate=("within_neighbor_range", "mean"),
+        mean_neighbor_distance=("mean_neighbor_distance", "mean"),
+        n=("synthetic_id", "nunique")
+    )
+    .reset_index()
+    .sort_values(["metric", "target_PHQ8_group"])
+)
+
+synthetic_level_df = (
+    comparison_df
+    .groupby(["synthetic_id", "target_PHQ8_Score", "target_PHQ8_binary", "target_PHQ8_group"])
+    .agg(
+        mean_abs_z_diff=("abs_z_diff", "mean"),
+        median_abs_z_diff=("abs_z_diff", "median"),
+        mean_neighbor_distance=("mean_neighbor_distance", "mean"),
+        within_neighbor_range_rate=("within_neighbor_range", "mean")
+    )
+    .reset_index()
 )
 
 
@@ -354,16 +512,22 @@ summary_df = (
 # ----------------------------------------------------------------------
 comparison_file = OUTPUT_DIR / "neighbor_pattern_comparison_long.csv"
 summary_file = OUTPUT_DIR / "neighbor_pattern_summary.csv"
+summary_by_phq_group_file = OUTPUT_DIR / "neighbor_pattern_summary_by_phq_group.csv"
 neighbor_ids_file = OUTPUT_DIR / "synthetic_neighbor_ids.csv"
+synthetic_level_file = OUTPUT_DIR / "synthetic_level_summary.csv"
 
 comparison_df.to_csv(comparison_file, index=False)
 summary_df.to_csv(summary_file, index=False)
+summary_by_phq_group_df.to_csv(summary_by_phq_group_file, index=False)
 neighbor_ids_df.to_csv(neighbor_ids_file, index=False)
+synthetic_level_df.to_csv(synthetic_level_file, index=False)
 
 print("Gespeichert:")
 print(comparison_file)
 print(summary_file)
+print(summary_by_phq_group_file)
 print(neighbor_ids_file)
+print(synthetic_level_file)
 
 
 # ----------------------------------------------------------------------
@@ -404,7 +568,7 @@ plt.show()
 
 
 # ----------------------------------------------------------------------
-# Optional: Scatterplots für wenige zentrale Metriken
+# Plot 3: Scatterplots pro Metrik mit PHQ-Markierung
 # ----------------------------------------------------------------------
 selected_metrics = [
     "n_turns",
@@ -417,24 +581,168 @@ selected_metrics = [
 for metric in selected_metrics:
     tmp = comparison_df[comparison_df["metric"] == metric].dropna(
         subset=["synthetic_value", "neighbor_mean"]
-    )
+    ).copy()
 
     if tmp.empty:
         continue
 
     plt.figure(figsize=(5, 5))
-    plt.scatter(tmp["neighbor_mean"], tmp["synthetic_value"], alpha=0.8)
+
+    tmp_low = tmp[tmp["target_PHQ8_binary"] == False]
+    tmp_high = tmp[tmp["target_PHQ8_binary"] == True]
+
+    plt.scatter(
+        tmp_low["neighbor_mean"],
+        tmp_low["synthetic_value"],
+        alpha=0.8,
+        marker="o",
+        label="Target PHQ < 10"
+    )
+
+    plt.scatter(
+        tmp_high["neighbor_mean"],
+        tmp_high["synthetic_value"],
+        alpha=0.9,
+        marker="X",
+        s=90,
+        label="Target PHQ >= 10"
+    )
 
     min_val = min(tmp["neighbor_mean"].min(), tmp["synthetic_value"].min())
     max_val = max(tmp["neighbor_mean"].max(), tmp["synthetic_value"].max())
 
-    plt.plot([min_val, max_val], [min_val, max_val], linestyle="--", linewidth=1)
+    plt.plot(
+        [min_val, max_val],
+        [min_val, max_val],
+        linestyle="--",
+        linewidth=1
+    )
 
     plt.xlabel("Neighbor mean")
     plt.ylabel("Synthetic value")
     plt.title(f"Synthetic vs. neighbor mean: {metric}")
+    plt.legend()
     plt.tight_layout()
 
-    plot_file = OUTPUT_DIR / f"scatter_synthetic_vs_neighbor_{metric}.png"
+    plot_file = OUTPUT_DIR / f"scatter_synthetic_vs_neighbor_{metric}_phq_group.png"
     plt.savefig(plot_file, dpi=300)
     plt.show()
+
+
+# ----------------------------------------------------------------------
+# Plot 4: Sind PHQ >= 10 Targets weiter von ihren Neighbors entfernt?
+# ----------------------------------------------------------------------
+distance_df = neighbor_ids_df.dropna(
+    subset=["target_PHQ8_Score", "mean_neighbor_distance"]
+).copy()
+
+plt.figure(figsize=(6, 5))
+
+low = distance_df[distance_df["target_PHQ8_binary"] == False]
+high = distance_df[distance_df["target_PHQ8_binary"] == True]
+
+plt.scatter(
+    low["target_PHQ8_Score"],
+    low["mean_neighbor_distance"],
+    alpha=0.8,
+    marker="o",
+    label="Target PHQ < 10"
+)
+
+plt.scatter(
+    high["target_PHQ8_Score"],
+    high["mean_neighbor_distance"],
+    alpha=0.9,
+    marker="X",
+    s=90,
+    label="Target PHQ >= 10"
+)
+
+plt.axvline(PHQ_CUTOFF, linestyle="--", linewidth=1)
+plt.xlabel("Target PHQ-8 Score")
+plt.ylabel("Mean neighbor distance")
+plt.title("Neighbor distance by target PHQ-8 score")
+plt.legend()
+plt.tight_layout()
+
+plot4_file = OUTPUT_DIR / "neighbor_distance_by_target_phq_score.png"
+plt.savefig(plot4_file, dpi=300)
+plt.show()
+
+
+# ----------------------------------------------------------------------
+# Plot 5: Durchschnittliche Pattern-Abweichung pro synthetischem Transcript
+# ----------------------------------------------------------------------
+plt.figure(figsize=(6, 5))
+
+low = synthetic_level_df[synthetic_level_df["target_PHQ8_binary"] == False]
+high = synthetic_level_df[synthetic_level_df["target_PHQ8_binary"] == True]
+
+plt.scatter(
+    low["target_PHQ8_Score"],
+    low["mean_abs_z_diff"],
+    alpha=0.8,
+    marker="o",
+    label="Target PHQ < 10"
+)
+
+plt.scatter(
+    high["target_PHQ8_Score"],
+    high["mean_abs_z_diff"],
+    alpha=0.9,
+    marker="X",
+    s=90,
+    label="Target PHQ >= 10"
+)
+
+plt.axvline(PHQ_CUTOFF, linestyle="--", linewidth=1)
+plt.xlabel("Target PHQ-8 Score")
+plt.ylabel("Mean absolute z-difference")
+plt.title("Overall pattern deviation by target PHQ-8 score")
+plt.legend()
+plt.tight_layout()
+
+plot5_file = OUTPUT_DIR / "overall_pattern_deviation_by_target_phq_score.png"
+plt.savefig(plot5_file, dpi=300)
+plt.show()
+
+
+# ----------------------------------------------------------------------
+# Plot 6: Anteil High-PHQ-Nachbar:innen pro synthetischem Transcript
+# ----------------------------------------------------------------------
+plt.figure(figsize=(6, 5))
+
+low = neighbor_ids_df[neighbor_ids_df["target_PHQ8_binary"] == False]
+high = neighbor_ids_df[neighbor_ids_df["target_PHQ8_binary"] == True]
+
+plt.scatter(
+    low["target_PHQ8_Score"],
+    low["share_neighbor_PHQ_ge_10"],
+    alpha=0.8,
+    marker="o",
+    label="Target PHQ < 10"
+)
+
+plt.scatter(
+    high["target_PHQ8_Score"],
+    high["share_neighbor_PHQ_ge_10"],
+    alpha=0.9,
+    marker="X",
+    s=90,
+    label="Target PHQ >= 10"
+)
+
+plt.axvline(PHQ_CUTOFF, linestyle="--", linewidth=1)
+plt.ylim(-0.05, 1.05)
+plt.xlabel("Target PHQ-8 Score")
+plt.ylabel("Share of neighbors with PHQ >= 10")
+plt.title("High-PHQ neighbor availability")
+plt.legend()
+plt.tight_layout()
+
+plot6_file = OUTPUT_DIR / "share_high_phq_neighbors_by_target_phq_score.png"
+plt.savefig(plot6_file, dpi=300)
+plt.show()
+
+
+print("Fertig.")
