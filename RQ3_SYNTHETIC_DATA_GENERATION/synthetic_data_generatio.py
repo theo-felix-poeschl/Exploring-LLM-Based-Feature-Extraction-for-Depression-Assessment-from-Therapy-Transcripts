@@ -43,7 +43,7 @@ FEATURE_COLUMNS = [
     "PHQ8_Sleep",
 ]
 
-N_SYNTHETIC = 10
+N_SYNTHETIC = 189
 N_FEW_SHOT   = 5
 MAX_EXAMPLE_TURNS = None  # None → komplette Beispiel-Transkripte
 
@@ -104,14 +104,14 @@ print("Participants mit Transcript:", transcript_df["Participant_ID"].nunique())
 # Ziel-Feature-Kombinationen erzeugen
 # ----------------------------------------------------------------------
 target_features = pd.DataFrame({
-    "PHQ8_Concentrating": np.random.randint(0, 3, size=N_SYNTHETIC),
-    "PHQ8_Appetite":      np.random.randint(0, 3, size=N_SYNTHETIC),
-    "PHQ8_Depressed":     np.random.randint(0, 3, size=N_SYNTHETIC),
-    "PHQ8_Tired":         np.random.randint(0, 3, size=N_SYNTHETIC),
-    "PHQ8_NoInterest":    np.random.randint(0, 3, size=N_SYNTHETIC),
-    "PHQ8_Failure":       np.random.randint(0, 3, size=N_SYNTHETIC),
-    "PHQ8_Moving":        np.random.randint(0, 3, size=N_SYNTHETIC),
-    "PHQ8_Sleep":         np.random.randint(0, 3, size=N_SYNTHETIC),
+    "PHQ8_Concentrating": np.random.randint(0, 4, size=N_SYNTHETIC),
+    "PHQ8_Appetite":      np.random.randint(0, 4, size=N_SYNTHETIC),
+    "PHQ8_Depressed":     np.random.randint(0, 4, size=N_SYNTHETIC),
+    "PHQ8_Tired":         np.random.randint(0, 4, size=N_SYNTHETIC),
+    "PHQ8_NoInterest":    np.random.randint(0, 4, size=N_SYNTHETIC),
+    "PHQ8_Failure":       np.random.randint(0, 4, size=N_SYNTHETIC),
+    "PHQ8_Moving":        np.random.randint(0, 4, size=N_SYNTHETIC),
+    "PHQ8_Sleep":         np.random.randint(0, 4, size=N_SYNTHETIC),
 })
 
 target_features["synthetic_id"] = [f"syn_{i:04d}" for i in range(len(target_features))]
@@ -120,6 +120,17 @@ target_features["synthetic_id"] = [f"syn_{i:04d}" for i in range(len(target_feat
 # ----------------------------------------------------------------------
 # Hilfsfunktionen
 # ----------------------------------------------------------------------
+def normalize_speaker(speaker):
+    s = str(speaker).strip().lower()
+
+    if s in ["participant", "patient", "client"]:
+        return "Participant"
+
+    if s in ["ellie", "therapist", "interviewer", "clinician"]:
+        return "Therapist"
+
+    return None
+
 def make_transcript(group):
     """Erzeugt einen Text-Block aus den Zeilen einer Person."""
     group = group.sort_values("start_time").reset_index(drop=True)
@@ -128,7 +139,17 @@ def make_transcript(group):
         start_idx = random.randint(0, len(group) - MAX_EXAMPLE_TURNS)
         group = group.iloc[start_idx:start_idx + MAX_EXAMPLE_TURNS]
 
-    lines = [f"{row['speaker']} | {row['value']}" for _, row in group.iterrows()]
+    lines = []
+
+    for _, row in group.iterrows():
+        speaker = normalize_speaker(row["speaker"])
+        value = str(row["value"]).strip()
+
+        if speaker is None or not value:
+            continue
+
+        lines.append(f"{speaker} | {value}")
+
     return "\n".join(lines)
 
 
@@ -519,6 +540,8 @@ for _, row in tqdm(target_features.iterrows(), total=len(target_features)):
     try:
         persona = generate_random_persona(gender=random.choice(GENDERS), age_range=(18, 80))
         examples = get_few_shot_examples(query_point)
+        for ex in examples[:1]:
+            print(ex["transcript"].splitlines()[:20])
 
         neighbor_mean_n_turns = int(round(np.mean([ex["n_turns"] for ex in examples])))
 
@@ -528,7 +551,7 @@ for _, row in tqdm(target_features.iterrows(), total=len(target_features)):
             examples=examples,
             neighbor_mean_n_turns=neighbor_mean_n_turns
         )
-        
+
         transcript = call_llm(messages)
 
         long_rows = transcript_to_long_rows(
