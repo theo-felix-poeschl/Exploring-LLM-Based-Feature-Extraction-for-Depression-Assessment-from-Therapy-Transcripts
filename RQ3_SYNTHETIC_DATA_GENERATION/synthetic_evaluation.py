@@ -11,6 +11,10 @@ from pathlib import Path
 from tqdm import tqdm
 from neighboring import find_neighbors
 
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
 
 # ----------------------------------------------------------------------
 # Pfade
@@ -51,7 +55,7 @@ TARGET_COLUMNS = [f"target_{col}" for col in FEATURE_COLUMNS]
 
 N_NEIGHBORS = 5
 SHORT_TURN_WORD_THRESHOLD = 3
-PHQ_CUTOFF = 10
+PHQ_CUTOFF = 14
 
 
 # ----------------------------------------------------------------------
@@ -94,16 +98,16 @@ synthetic_df["target_PHQ8_Score"] = synthetic_df[TARGET_COLUMNS].sum(axis=1)
 synthetic_df["target_PHQ8_binary"] = synthetic_df["target_PHQ8_Score"] >= PHQ_CUTOFF
 synthetic_df["target_PHQ8_group"] = np.where(
     synthetic_df["target_PHQ8_binary"],
-    "PHQ >= 10",
-    "PHQ < 10"
+    f"PHQ >= {PHQ_CUTOFF} ",
+    f"PHQ < {PHQ_CUTOFF}"
 )
 
 features_df["real_PHQ8_Score_from_items"] = features_df[FEATURE_COLUMNS].sum(axis=1)
 features_df["real_PHQ8_binary_from_items"] = features_df["real_PHQ8_Score_from_items"] >= PHQ_CUTOFF
 features_df["real_PHQ8_group_from_items"] = np.where(
     features_df["real_PHQ8_binary_from_items"],
-    "PHQ >= 10",
-    "PHQ < 10"
+    f"PHQ >= {PHQ_CUTOFF}",
+    f"PHQ < {PHQ_CUTOFF}"
 )
 
 print("Synthetic rows:", synthetic_df.shape)
@@ -238,7 +242,8 @@ def compute_pattern_features(df, collapse_same_speaker=True):
         "therapist_words": therapist_words,
         "participant_word_ratio": participant_words / total_words if total_words > 0 else np.nan,
 
-        "mean_participant_words": np.mean(participant_word_counts) if len(participant_word_counts) > 0 else np.nan,
+        "mean_participant_words_per_turn": np.mean(participant_word_counts) if len(participant_word_counts) > 0 else np.nan,
+        "median_participant_words_per_turn": np.median(participant_word_counts) if len(participant_word_counts) > 0 else np.nan,
         "median_participant_words": np.median(participant_word_counts) if len(participant_word_counts) > 0 else np.nan,
         "sd_participant_words": np.std(participant_word_counts, ddof=1) if len(participant_word_counts) > 1 else np.nan,
 
@@ -345,8 +350,8 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
     max_neighbor_distance = neighbor_df["neighbor_distance"].max()
 
     mean_neighbor_phq8_score = neighbor_meta["real_PHQ8_Score_from_items"].mean()
-    n_neighbor_phq_ge_10 = int(neighbor_meta["real_PHQ8_binary_from_items"].sum())
-    share_neighbor_phq_ge_10 = neighbor_meta["real_PHQ8_binary_from_items"].mean()
+    n_neighbor_phq_ge_cutoff = int(neighbor_meta["real_PHQ8_binary_from_items"].sum())
+    share_neighbor_phq_ge_cutoff = neighbor_meta["real_PHQ8_binary_from_items"].mean()
 
     neighbor_id_rows.append({
         "synthetic_id": synthetic_id,
@@ -362,15 +367,30 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
         "max_neighbor_distance": max_neighbor_distance,
 
         "mean_neighbor_PHQ8_Score": mean_neighbor_phq8_score,
-        "n_neighbor_PHQ_ge_10": n_neighbor_phq_ge_10,
-        "share_neighbor_PHQ_ge_10": share_neighbor_phq_ge_10,
+        "n_neighbor_PHQ_ge_cutoff": n_neighbor_phq_ge_cutoff,
+        "share_neighbor_PHQ_ge_cutoff": share_neighbor_phq_ge_cutoff,
     })
 
-    # -----------------------------
+        # -----------------------------
     # Synthetische Pattern berechnen
     # -----------------------------
     syn_transcript = synthetic_df[synthetic_df["synthetic_id"] == synthetic_id]
-    syn_patterns = compute_pattern_features(syn_transcript)
+
+    syn_patterns_utterance = compute_pattern_features(
+        syn_transcript,
+        collapse_same_speaker=False
+    )
+
+    syn_patterns_turn = compute_pattern_features(
+        syn_transcript,
+        collapse_same_speaker=True
+    )
+
+    # Level explizit in die Metriknamen schreiben
+    syn_patterns = {
+        **{f"{k}_utterancelevel": v for k, v in syn_patterns_utterance.items()},
+        **{f"{k}_turnlevel": v for k, v in syn_patterns_turn.items()},
+    }
 
     # -----------------------------
     # Neighbor-Pattern berechnen
@@ -383,7 +403,21 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
         if len(real_transcript) == 0:
             continue
 
-        pattern = compute_pattern_features(real_transcript)
+        pattern_utterance = compute_pattern_features(
+            real_transcript,
+            collapse_same_speaker=False
+        )
+
+        pattern_turn = compute_pattern_features(
+            real_transcript,
+            collapse_same_speaker=True
+        )
+
+        pattern = {
+            **{f"{k}_utterancelevel": v for k, v in pattern_utterance.items()},
+            **{f"{k}_turnlevel": v for k, v in pattern_turn.items()},
+        }
+
         pattern["Participant_ID"] = pid
         neighbor_pattern_rows.append(pattern)
 
@@ -397,6 +431,9 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
     # Vergleich synthetisch vs. Neighbor-Mittelwert
     # -----------------------------
     for metric_name, synthetic_value in syn_patterns.items():
+        if metric_name not in neighbor_patterns_df.columns:
+            continue
+
         neighbor_values = neighbor_patterns_df[metric_name].dropna()
 
         if len(neighbor_values) == 0:
@@ -440,12 +477,11 @@ for _, syn_row in tqdm(synthetic_targets.iterrows(), total=len(synthetic_targets
             "max_neighbor_distance": max_neighbor_distance,
 
             "mean_neighbor_PHQ8_Score": mean_neighbor_phq8_score,
-            "n_neighbor_PHQ_ge_10": n_neighbor_phq_ge_10,
-            "share_neighbor_PHQ_ge_10": share_neighbor_phq_ge_10,
+            "n_neighbor_PHQ_ge_cutoff": n_neighbor_phq_ge_cutoff,
+            "share_neighbor_PHQ_ge_cutoff": share_neighbor_phq_ge_cutoff,
 
             "n_neighbors_used": len(neighbor_values)
         })
-
 
 comparison_df = pd.DataFrame(comparison_rows)
 neighbor_ids_df = pd.DataFrame(neighbor_id_rows)
@@ -506,219 +542,351 @@ synthetic_level_df = (
     .reset_index()
 )
 
-# ----------------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 160,
+    "savefig.dpi": 300,
+    "font.size": 10,
+    "axes.titlesize": 13,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+COLOR_BAR = "#6C8EAD"          # muted steel blue
+COLOR_BAR_2 = "#7A9E7E"       # muted sage
+COLOR_LOW = "lightcoral"          # PHQ < {PHQ_CUTOFF}
+COLOR_HIGH = "darkblue"         # PHQ >= {PHQ_CUTOFF}
+COLOR_REF = "gray"
+COLOR_GRID = "lightgray"
+
+
+def prettify_ax(ax, grid_axis="x"):
+    ax.grid(axis=grid_axis, alpha=1, linewidth=0.8, color=COLOR_GRID)
+    ax.set_axisbelow(True)
+    ax.spines["left"].set_alpha(1)
+    ax.spines["bottom"].set_alpha(1)
+    ax.tick_params(axis="both", length=0)
+
+
+def pretty_metric_name(metric):
+    return (
+        str(metric)
+        .replace("_", " ")
+        .replace("phq", "PHQ")
+        .replace("ttr", "TTR")
+        .title()
+    )
+
+
+def add_bar_labels(ax, bars, values, fmt="{:.2f}", offset_frac=0.015):
+    max_val = np.nanmax(np.abs(values))
+    if np.isnan(max_val) or max_val == 0:
+        max_val = 1
+
+    offset = max_val * offset_frac
+
+    for bar, value in zip(bars, values):
+        x = bar.get_width()
+        y = bar.get_y() + bar.get_height() / 2
+
+        ax.text(
+            x + offset,
+            y,
+            fmt.format(value),
+            va="center",
+            ha="left",
+            fontsize=8.5,
+            color="#333333"
+        )
+
+
+def set_scatter_limits(ax, x, y):
+    min_val = min(np.nanmin(x), np.nanmin(y))
+    max_val = max(np.nanmax(x), np.nanmax(y))
+
+    value_range = max_val - min_val
+    if value_range == 0:
+        value_range = 1
+
+    pad = value_range * 0.08
+
+    ax.set_xlim(min_val - pad, max_val + pad)
+    ax.set_ylim(min_val - pad, max_val + pad)
+
+
+def scatter_by_phq_group(
+    ax,
+    data,
+    x_col,
+    y_col,
+    xlabel,
+    ylabel,
+    title,
+    diagonal=False,
+    ylim=None
+):
+    low = data[data["target_PHQ8_binary"] == False]
+    high = data[data["target_PHQ8_binary"] == True]
+
+    ax.scatter(
+        low[x_col],
+        low[y_col],
+        alpha=1.0,
+        s=42,
+        marker="o",
+        color=COLOR_LOW,
+        edgecolor="white",
+        linewidth=0.6,
+        label=f"Target PHQ < {PHQ_CUTOFF}"
+    )
+
+    ax.scatter(
+        high[x_col],
+        high[y_col],
+        alpha=1.0,
+        s=42,
+        marker="o",
+        color=COLOR_HIGH,
+        edgecolor="white",
+        linewidth=0.6,
+        label=f"Target PHQ ≥ {PHQ_CUTOFF}"
+    )
+
+    if diagonal:
+        min_val = min(data[x_col].min(), data[y_col].min())
+        max_val = max(data[x_col].max(), data[y_col].max())
+
+        ax.plot(
+            [min_val, max_val],
+            [min_val, max_val],
+            linestyle="--",
+            linewidth=1,
+            color=COLOR_REF,
+            alpha=1.0,
+            label="Perfect agreement"
+        )
+
+        set_scatter_limits(ax, data[x_col], data[y_col])
+
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    ax.axvline(
+        PHQ_CUTOFF,
+        linestyle="--",
+        linewidth=1,
+        color=COLOR_REF,
+        alpha=1.0
+    ) if x_col == "target_PHQ8_Score" else None
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontweight="bold", pad=10)
+
+    prettify_ax(ax, grid_axis="both")
+
+    ax.legend(
+        frameon=False,
+        loc="best"
+    )
+
+
+# ============================================================
 # Plot 1: Mean absolute z-difference pro Pattern
-# ----------------------------------------------------------------------
+# ============================================================
+
 plot_df = summary_df.dropna(subset=["mean_abs_z_diff"]).copy()
 plot_df = plot_df.sort_values("mean_abs_z_diff", ascending=True)
+plot_df["metric_label"] = plot_df["metric"].apply(pretty_metric_name)
 
-plt.figure(figsize=(8, 6))
-plt.barh(plot_df["metric"], plot_df["mean_abs_z_diff"])
-plt.axvline(1.0, linestyle="--", linewidth=1)
-plt.xlabel("Mean absolute z-difference to neighbor mean")
-plt.ylabel("Pattern metric")
-plt.title("Synthetic transcripts vs. nearest-neighbor patterns")
+fig, ax = plt.subplots(figsize=(8.5, 6.2))
+
+bars = ax.barh(
+    plot_df["metric_label"],
+    plot_df["mean_abs_z_diff"],
+    color=COLOR_BAR,
+    edgecolor="white",
+    linewidth=1.0,
+    alpha=1
+)
+
+add_bar_labels(
+    ax,
+    bars,
+    plot_df["mean_abs_z_diff"].values,
+    fmt="{:.2f}"
+)
+
+ax.set_xlabel("Mean absolute z-difference to neighbor mean")
+ax.set_ylabel("Pattern metric")
+ax.set_title(
+    "Synthetic Transcripts vs. Nearest-Neighbor Patterns",
+    fontweight="bold",
+    pad=12
+)
+
+xmax = max(plot_df["mean_abs_z_diff"].max() * 1.18, 1.15)
+ax.set_xlim(0, xmax)
+
+prettify_ax(ax, grid_axis="x")
+ax.legend(frameon=False, loc="lower right")
+
 plt.tight_layout()
 
 plot1_file = OUTPUT_DIR / "mean_abs_z_diff_by_metric.png"
-plt.savefig(plot1_file, dpi=300)
+plt.savefig(plot1_file, dpi=300, bbox_inches="tight")
 plt.show()
 
 
-# ----------------------------------------------------------------------
+# ============================================================
 # Plot 2: Range Coverage pro Pattern
-# ----------------------------------------------------------------------
-coverage_df = summary_df.sort_values("within_neighbor_range_rate", ascending=True)
+# ============================================================
 
-plt.figure(figsize=(8, 6))
-plt.barh(coverage_df["metric"], coverage_df["within_neighbor_range_rate"])
-plt.xlim(0, 1)
-plt.xlabel("Share within neighbor min-max range")
-plt.ylabel("Pattern metric")
-plt.title("How often synthetic patterns fall within neighbor range")
+coverage_df = summary_df.dropna(subset=["within_neighbor_range_rate"]).copy()
+coverage_df = coverage_df.sort_values("within_neighbor_range_rate", ascending=True)
+coverage_df["metric_label"] = coverage_df["metric"].apply(pretty_metric_name)
+
+fig, ax = plt.subplots(figsize=(8.5, 6.2))
+
+bars = ax.barh(
+    coverage_df["metric_label"],
+    coverage_df["within_neighbor_range_rate"],
+    color=COLOR_BAR_2,
+    edgecolor="white",
+    linewidth=1.0,
+    alpha=1
+)
+
+add_bar_labels(
+    ax,
+    bars,
+    coverage_df["within_neighbor_range_rate"].values,
+    fmt="{:.2f}",
+    offset_frac=0.012
+)
+
+ax.set_xlim(0, 1.08)
+ax.xaxis.set_major_formatter(PercentFormatter(xmax=1))
+
+ax.set_xlabel("Share within neighbor min-max range")
+ax.set_ylabel("Pattern metric")
+ax.set_title(
+    "Coverage of Neighbor Ranges by Synthetic Patterns",
+    fontweight="bold",
+    pad=12
+)
+
+prettify_ax(ax, grid_axis="x")
+
 plt.tight_layout()
 
 plot2_file = OUTPUT_DIR / "neighbor_range_coverage_by_metric.png"
-plt.savefig(plot2_file, dpi=300)
+plt.savefig(plot2_file, dpi=300, bbox_inches="tight")
 plt.show()
 
 
-# ----------------------------------------------------------------------
+# ============================================================
 # Plot 3: Scatterplots pro Metrik mit PHQ-Markierung
-# ----------------------------------------------------------------------
+# ============================================================
+
+# selected_metrics = [
+#     "n_turns_turnlevel",
+#     "participant_words_turnlevel",
+#     "median_participant_words_per_turn_turnlevel",
+#     "short_participant_turn_ratio_turnlevel",
+#     "ttr_participant_turnlevel",
+# ]
+
 selected_metrics = [
-    "n_turns",
-    "participant_words",
-    "mean_participant_words",
-    "short_participant_turn_ratio",
-    "ttr_participant",
+    "mean_participant_words_per_turn_utterancelevel",
+    "mean_participant_words_per_turn_turnlevel",
+    "median_participant_words_per_turn_utterancelevel",
+    "median_participant_words_per_turn_turnlevel",
 ]
 
 for metric in selected_metrics:
     tmp = comparison_df[comparison_df["metric"] == metric].dropna(
-        subset=["synthetic_value", "neighbor_mean"]
+        subset=["synthetic_value", "neighbor_mean", "target_PHQ8_binary"]
     ).copy()
 
     if tmp.empty:
         continue
 
-    plt.figure(figsize=(5, 5))
+    fig, ax = plt.subplots(figsize=(5.6, 5.2))
 
-    tmp_low = tmp[tmp["target_PHQ8_binary"] == False]
-    tmp_high = tmp[tmp["target_PHQ8_binary"] == True]
-
-    plt.scatter(
-        tmp_low["neighbor_mean"],
-        tmp_low["synthetic_value"],
-        alpha=0.8,
-        marker="o",
-        label="Target PHQ < 10"
+    scatter_by_phq_group(
+        ax=ax,
+        data=tmp,
+        x_col="neighbor_mean",
+        y_col="synthetic_value",
+        xlabel="Neighbor mean",
+        ylabel="Synthetic value",
+        title=f"Synthetic vs. Neighbor Mean\n{pretty_metric_name(metric)}",
+        diagonal=True
     )
 
-    plt.scatter(
-        tmp_high["neighbor_mean"],
-        tmp_high["synthetic_value"],
-        alpha=0.9,
-        marker="X",
-        s=90,
-        label="Target PHQ >= 10"
-    )
-
-    min_val = min(tmp["neighbor_mean"].min(), tmp["synthetic_value"].min())
-    max_val = max(tmp["neighbor_mean"].max(), tmp["synthetic_value"].max())
-
-    plt.plot(
-        [min_val, max_val],
-        [min_val, max_val],
-        linestyle="--",
-        linewidth=1
-    )
-
-    plt.xlabel("Neighbor mean")
-    plt.ylabel("Synthetic value")
-    plt.title(f"Synthetic vs. neighbor mean: {metric}")
-    plt.legend()
     plt.tight_layout()
 
     plot_file = OUTPUT_DIR / f"scatter_synthetic_vs_neighbor_{metric}_phq_group.png"
-    plt.savefig(plot_file, dpi=300)
+    plt.savefig(plot_file, dpi=300, bbox_inches="tight")
     plt.show()
 
 
-# ----------------------------------------------------------------------
-# Plot 4: Sind PHQ >= 10 Targets weiter von ihren Neighbors entfernt?
-# ----------------------------------------------------------------------
+# ============================================================
+# Plot 4: Sind PHQ >= {PHQ_CUTOFF} Targets weiter von ihren Nachbar:innen entfernt?
+# ============================================================
+
 distance_df = neighbor_ids_df.dropna(
-    subset=["target_PHQ8_Score", "mean_neighbor_distance"]
+    subset=["target_PHQ8_Score", "mean_neighbor_distance", "target_PHQ8_binary"]
 ).copy()
 
-plt.figure(figsize=(6, 5))
+fig, ax = plt.subplots(figsize=(6.2, 5.2))
 
-low = distance_df[distance_df["target_PHQ8_binary"] == False]
-high = distance_df[distance_df["target_PHQ8_binary"] == True]
-
-plt.scatter(
-    low["target_PHQ8_Score"],
-    low["mean_neighbor_distance"],
-    alpha=0.8,
-    marker="o",
-    label="Target PHQ < 10"
+scatter_by_phq_group(
+    ax=ax,
+    data=distance_df,
+    x_col="target_PHQ8_Score",
+    y_col="mean_neighbor_distance",
+    xlabel="Target PHQ-8 score",
+    ylabel="Mean neighbor distance",
+    title="Neighbor Distance by Target PHQ-8 Score",
+    diagonal=False
 )
 
-plt.scatter(
-    high["target_PHQ8_Score"],
-    high["mean_neighbor_distance"],
-    alpha=0.9,
-    marker="X",
-    s=90,
-    label="Target PHQ >= 10"
-)
-
-plt.axvline(PHQ_CUTOFF, linestyle="--", linewidth=1)
-plt.xlabel("Target PHQ-8 Score")
-plt.ylabel("Mean neighbor distance")
-plt.title("Neighbor distance by target PHQ-8 score")
-plt.legend()
 plt.tight_layout()
 
 plot4_file = OUTPUT_DIR / "neighbor_distance_by_target_phq_score.png"
-plt.savefig(plot4_file, dpi=300)
+plt.savefig(plot4_file, dpi=300, bbox_inches="tight")
 plt.show()
 
 
-# ----------------------------------------------------------------------
+# ============================================================
 # Plot 5: Durchschnittliche Pattern-Abweichung pro synthetischem Transcript
-# ----------------------------------------------------------------------
-plt.figure(figsize=(6, 5))
+# ============================================================
 
-low = synthetic_level_df[synthetic_level_df["target_PHQ8_binary"] == False]
-high = synthetic_level_df[synthetic_level_df["target_PHQ8_binary"] == True]
+plot5_df = synthetic_level_df.dropna(
+    subset=["target_PHQ8_Score", "mean_abs_z_diff", "target_PHQ8_binary"]
+).copy()
 
-plt.scatter(
-    low["target_PHQ8_Score"],
-    low["mean_abs_z_diff"],
-    alpha=0.8,
-    marker="o",
-    label="Target PHQ < 10"
+fig, ax = plt.subplots(figsize=(6.2, 5.2))
+
+scatter_by_phq_group(
+    ax=ax,
+    data=plot5_df,
+    x_col="target_PHQ8_Score",
+    y_col="mean_abs_z_diff",
+    xlabel="Target PHQ-8 score",
+    ylabel="Mean absolute z-difference",
+    title="Overall Pattern Deviation by Target PHQ-8 Score",
+    diagonal=False
 )
 
-plt.scatter(
-    high["target_PHQ8_Score"],
-    high["mean_abs_z_diff"],
-    alpha=0.9,
-    marker="X",
-    s=90,
-    label="Target PHQ >= 10"
-)
-
-plt.axvline(PHQ_CUTOFF, linestyle="--", linewidth=1)
-plt.xlabel("Target PHQ-8 Score")
-plt.ylabel("Mean absolute z-difference")
-plt.title("Overall pattern deviation by target PHQ-8 score")
-plt.legend()
 plt.tight_layout()
 
 plot5_file = OUTPUT_DIR / "overall_pattern_deviation_by_target_phq_score.png"
-plt.savefig(plot5_file, dpi=300)
+plt.savefig(plot5_file, dpi=300, bbox_inches="tight")
 plt.show()
-
-
-# ----------------------------------------------------------------------
-# Plot 6: Anteil High-PHQ-Nachbar:innen pro synthetischem Transcript
-# ----------------------------------------------------------------------
-plt.figure(figsize=(6, 5))
-
-low = neighbor_ids_df[neighbor_ids_df["target_PHQ8_binary"] == False]
-high = neighbor_ids_df[neighbor_ids_df["target_PHQ8_binary"] == True]
-
-plt.scatter(
-    low["target_PHQ8_Score"],
-    low["share_neighbor_PHQ_ge_10"],
-    alpha=0.8,
-    marker="o",
-    label="Target PHQ < 10"
-)
-
-plt.scatter(
-    high["target_PHQ8_Score"],
-    high["share_neighbor_PHQ_ge_10"],
-    alpha=0.9,
-    marker="X",
-    s=90,
-    label="Target PHQ >= 10"
-)
-
-plt.axvline(PHQ_CUTOFF, linestyle="--", linewidth=1)
-plt.ylim(-0.05, 1.05)
-plt.xlabel("Target PHQ-8 Score")
-plt.ylabel("Share of neighbors with PHQ >= 10")
-plt.title("High-PHQ neighbor availability")
-plt.legend()
-plt.tight_layout()
-
-plot6_file = OUTPUT_DIR / "share_high_phq_neighbors_by_target_phq_score.png"
-plt.savefig(plot6_file, dpi=300)
-plt.show()
-
-
-print("Fertig.")
