@@ -23,7 +23,7 @@ from typing import Literal
 # Pfade & Konstanten
 # ----------------------------------------------------------------------
 FEATURES_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/INPUT/DAIC_META.csv")
-TRANSCRIPT_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/INPUT/DAIC_FULL_NO_TAGS.csv")
+TRANSCRIPT_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/INPUT/DAIC_FULL_FIXED_TIMES.csv")
 NEIGHBORING_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/INPUT/DAIC_META.csv")
 
 OUTPUT_FILE = Path("/home/jovyan/Exploring-LLM-Based-Feature-Extraction-for-Depression-Assessment-from-Therapy-Transcripts/OUTPUT/10_synthetic_transcripts_long.csv")
@@ -116,10 +116,17 @@ target_features = pd.DataFrame({
 
 target_features["synthetic_id"] = [f"syn_{i:04d}" for i in range(len(target_features))]
 
+def count_turns(group):
+    group = group.sort_values("start_time").copy()
+    group["speaker_normalized"] = group["speaker"].apply(normalize_speaker)
+    group = group.dropna(subset=["speaker_normalized"])
 
-# ----------------------------------------------------------------------
-# Hilfsfunktionen
-# ----------------------------------------------------------------------
+    return int(
+        group["speaker_normalized"]
+        .ne(group["speaker_normalized"].shift())
+        .sum()
+    )
+
 def normalize_speaker(speaker):
     s = str(speaker).strip().lower()
 
@@ -192,8 +199,7 @@ def get_few_shot_examples(query_point: dict) -> list:
             "PHQ8_Moving":        grp["PHQ8_Moving"].iloc[0],
             "PHQ8_Sleep":         grp["PHQ8_Sleep"].iloc[0],
 
-            # Anzahl der Turns im Neighbor-Transcript
-            "n_turns": len(grp),
+            "n_turns": count_turns(grp),
 
             # Das eigentliche Beispiel-Transkript
             "transcript": transcript
